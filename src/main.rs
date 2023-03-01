@@ -1,12 +1,11 @@
-use std::net::{Ipv4Addr, Ipv6Addr, UdpSocket};
+use std::net::UdpSocket;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 type Error = Box<dyn std::error::Error>;
 type Result<T> = std::result::Result<T, Error>;
 
 pub struct BytePacketBuffer {
-    // DNS 数据包限制为 512 字节
     pub buf: [u8; 512],
-    // keeping track of where we are
     pub pos: usize,
 }
 
@@ -18,63 +17,52 @@ impl BytePacketBuffer {
         }
     }
 
-    /// Current position within buffer
     fn pos(&self) -> usize {
         self.pos
     }
 
-    /// Step the buffer position forward a specific number of steps
     fn step(&mut self, steps: usize) -> Result<()> {
         self.pos += steps;
 
         Ok(())
     }
 
-    /// Change the buffer position
     fn seek(&mut self, pos: usize) -> Result<()> {
         self.pos = pos;
 
         Ok(())
     }
 
-    /// Read a single byte and move the position one step forward
     fn read(&mut self) -> Result<u8> {
         if self.pos >= 512 {
             return Err("End of buffer".into());
         }
-
         let res = self.buf[self.pos];
         self.pos += 1;
 
         Ok(res)
     }
 
-    /// Get a single byte, without changing the buffer position
     fn get(&mut self, pos: usize) -> Result<u8> {
         if pos >= 512 {
             return Err("End of buffer".into());
         }
-
         Ok(self.buf[pos])
     }
 
-    /// Get a range of bytes
     fn get_range(&mut self, start: usize, len: usize) -> Result<&[u8]> {
         if start + len >= 512 {
             return Err("End of buffer".into());
         }
-
         Ok(&self.buf[start..start + len as usize])
     }
 
-    /// Read two bytes, stepping two steps forward
     fn read_u16(&mut self) -> Result<u16> {
         let res = ((self.read()? as u16) << 8) | (self.read()? as u16);
 
         Ok(res)
     }
 
-    /// Read four bytes, stepping four steps forward
     fn read_u32(&mut self) -> Result<u32> {
         let res = ((self.read()? as u32) << 24)
             | ((self.read()? as u32) << 16)
@@ -84,28 +72,13 @@ impl BytePacketBuffer {
         Ok(res)
     }
 
-    /// Read a qname -> question name
-    ///
-    /// The tricky part: Reading domain names, taking labels into consideration.
-    /// Will take something like [3]www[6]google[3]com[0] and append
-    /// www.google.com to outstr.
     fn read_qname(&mut self, outstr: &mut String) -> Result<()> {
-        // Since we might encounter jumps, we'll keep track of our position
-        // locally as opposed to using the position within the struct. This
-        // allows us to move the shared position to a point past our current
-        // qname, while keeping track of our progress on the current qname
-        // using this variable.
         let mut pos = self.pos();
-
-        // track whether or not we've jumped
         let mut jumped = false;
+
+        let mut delim = "";
         let max_jumps = 5;
         let mut jumps_performed = 0;
-
-        // Our delimiter which we append for each label. Since we don't want a
-        // dot at the beginning of the domain name we'll leave it empty for now
-        // and set it to "." at the end of the first iteration.
-        let mut delim = "";
         loop {
             // Dns Packets are untrusted data, so we need to be paranoid. Someone
             // can craft a packet with a cycle in the jump instructions. This guards
@@ -114,51 +87,42 @@ impl BytePacketBuffer {
                 return Err(format!("Limit of {} jumps exceeded", max_jumps).into());
             }
 
-            // At this point, we're always at the beginning of a label. Recall
-            // that labels start with a length byte.
             let len = self.get(pos)?;
 
-            // If len has the two most significant bit are set, it represents a
-            // jump to some other offset in the packet:
+            // A two byte sequence, where the two highest bits of the first byte is
+            // set, represents a offset relative to the start of the buffer. We
+            // handle this by jumping to the offset, setting a flag to indicate
+            // that we shouldn't update the shared buffer position once done.
             if (len & 0xC0) == 0xC0 {
-                // Update the buffer position to a point past the current
-                // label. We don't need to touch it any further.
+                // When a jump is performed, we only modify the shared buffer
+                // position once, and avoid making the change later on.
                 if !jumped {
                     self.seek(pos + 2)?;
                 }
 
-                // Read another byte, calculate offset and perform the jump by
-                // updating our local position variable
                 let b2 = self.get(pos + 1)? as u16;
                 let offset = (((len as u16) ^ 0xC0) << 8) | b2;
                 pos = offset as usize;
-
-                // Indicate that a jump was performed.
                 jumped = true;
                 jumps_performed += 1;
-            } else { // The base scenario, where we're reading a single label and appending it to the output:
-                // Move a single byte forward to move past the length byte.
-                pos += 1;
-
-                // Domain names are terminated by an empty label of length 0,
-                // so if the length is zero we're done.
-                if len == 0 {
-                    break;
-                }
-
-                // Append the delimiter to our output buffer first.
-                outstr.push_str(delim);
-
-                // Extract the actual ASCII bytes for this label and append them
-                // to the output buffer.
-                let str_buffer = self.get_range(pos, len as usize)?;
-                outstr.push_str(&String::from_utf8_lossy(str_buffer).to_lowercase());
-
-                delim = ".";
-
-                // Move forward the full length of the label.
-                pos += len as usize;
+                continue;
             }
+
+            pos += 1;
+
+            // Names are terminated by an empty label of length 0
+            if len == 0 {
+                break;
+            }
+
+            outstr.push_str(delim);
+
+            let str_buffer = self.get_range(pos, len as usize)?;
+            outstr.push_str(&String::from_utf8_lossy(str_buffer).to_lowercase());
+
+            delim = ".";
+
+            pos += len as usize;
         }
 
         if !jumped {
@@ -172,10 +136,8 @@ impl BytePacketBuffer {
         if self.pos >= 512 {
             return Err("End of buffer".into());
         }
-
         self.buf[self.pos] = val;
         self.pos += 1;
-
         Ok(())
     }
 
@@ -204,7 +166,7 @@ impl BytePacketBuffer {
     fn write_qname(&mut self, qname: &str) -> Result<()> {
         for label in qname.split('.') {
             let len = label.len();
-            if len > 0x3f {
+            if len > 0x34 {
                 return Err("Single label exceeds 63 characters of length".into());
             }
 
@@ -325,6 +287,7 @@ impl DnsHeader {
         self.authoritative_entries = buffer.read_u16()?;
         self.resource_entries = buffer.read_u16()?;
 
+        // Return the constant header size
         Ok(())
     }
 
@@ -413,8 +376,8 @@ impl DnsQuestion {
         buffer.write_qname(&self.name)?;
 
         let typenum = self.qtype.to_num();
-        buffer.write_u16(typenum)?; // qtype
-        buffer.write_u16(1)?; // class
+        buffer.write_u16(typenum)?;
+        buffer.write_u16(1)?;
 
         Ok(())
     }
@@ -478,11 +441,7 @@ impl DnsRecord {
                     ((raw_addr >> 0) & 0xFF) as u8,
                 );
 
-                Ok(DnsRecord::A {
-                    domain,
-                    addr,
-                    ttl,
-                })
+                Ok(DnsRecord::A { domain, addr, ttl })
             }
             QueryType::AAAA => {
                 let raw_addr1 = buffer.read_u32()?;
@@ -500,11 +459,7 @@ impl DnsRecord {
                     ((raw_addr4 >> 0) & 0xFFFF) as u16,
                 );
 
-                Ok(DnsRecord::AAAA {
-                    domain,
-                    addr,
-                    ttl,
-                })
+                Ok(DnsRecord::AAAA { domain, addr, ttl })
             }
             QueryType::NS => {
                 let mut ns = String::new();
@@ -721,12 +676,74 @@ impl DnsPacket {
 
         Ok(())
     }
+
+    /// It's useful to be able to pick a random A record from a packet. When we
+    /// get multiple IP's for a single name, it doesn't matter which one we
+    /// choose, so in those cases we can now pick one at random.
+    pub fn get_random_a(&self) -> Option<Ipv4Addr> {
+        self.answers
+            .iter()
+            .filter_map(|record| match record {
+                DnsRecord::A { addr, .. } => Some(*addr),
+                _ => None,
+            })
+            .next()
+    }
+
+    /// A helper function which returns an iterator over all name servers in
+    /// the authorities section, represented as (domain, host) tuples
+    fn get_ns<'a>(&'a self, qname: &'a str) -> impl Iterator<Item = (&'a str, &'a str)> {
+        self.authorities
+            .iter()
+            // In practice, these are always NS records in well formed packages.
+            // Convert the NS records to a tuple which has only the data we need
+            // to make it easy to work with.
+            .filter_map(|record| match record {
+                DnsRecord::NS { domain, host, .. } => Some((domain.as_str(), host.as_str())),
+                _ => None,
+            })
+            // Discard servers which aren't authoritative to our query
+            .filter(move |(domain, _)| qname.ends_with(*domain))
+    }
+
+    /// We'll use the fact that name servers often bundle the corresponding
+    /// A records when replying to an NS query to implement a function that
+    /// returns the actual IP for an NS record if possible.
+    pub fn get_resolved_ns(&self, qname: &str) -> Option<Ipv4Addr> {
+        // Get an iterator over the nameservers in the authorities section
+        self.get_ns(qname)
+            // Now we need to look for a matching A record in the additional
+            // section. Since we just want the first valid record, we can just
+            // build a stream of matching records.
+            .flat_map(|(_, host)| {
+                self.resources
+                    .iter()
+                    // Filter for A records where the domain match the host
+                    // of the NS record that we are currently processing
+                    .filter_map(move |record| match record {
+                        DnsRecord::A { domain, addr, .. } if domain == host => Some(addr),
+                        _ => None,
+                    })
+            })
+            .map(|addr| *addr)
+            // Finally, pick the first valid entry
+            .next()
+    }
+
+    /// However, not all name servers are as that nice. In certain cases there won't
+    /// be any A records in the additional section, and we'll have to perform *another*
+    /// lookup in the midst. For this, we introduce a method for returning the host
+    /// name of an appropriate name server.
+    pub fn get_unresolved_ns<'a>(&'a self, qname: &'a str) -> Option<&'a str> {
+        // Get an iterator over the nameservers in the authorities section
+        self.get_ns(qname)
+            .map(|(_, host)| host)
+            // Finally, pick the first valid entry
+            .next()
+    }
 }
 
-fn lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket> {
-    // Forward queries to Google's public DNS
-    let server = ("8.8.8.8", 53);
-
+fn lookup(qname: &str, qtype: QueryType, server: (Ipv4Addr, u16)) -> Result<DnsPacket> {
     let socket = UdpSocket::bind(("0.0.0.0", 43210))?;
 
     let mut packet = DnsPacket::new();
@@ -748,40 +765,79 @@ fn lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket> {
     DnsPacket::from_buffer(&mut res_buffer)
 }
 
-/// Handle a single incoming packet
-fn handle_query(socket: &UdpSocket) -> Result<()> {
-    // With a socket ready, we can go ahead and read a packet. This will
-    // block until one is received.
-    let mut req_buffer = BytePacketBuffer::new();
+fn recursive_lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket> {
+    // For now we're always starting with *a.root-servers.net*.
+    let mut ns = "198.41.0.4".parse::<Ipv4Addr>().unwrap();
 
-    // The `recv_from` function will write the data into the provided buffer,
-    // and return the length of the data read as well as the source address.
-    // We're not interested in the length, but we need to keep track of the
-    // source in order to send our reply later on.
+    // Since it might take an arbitrary number of steps, we enter an unbounded loop.
+    loop {
+        println!("attempting lookup of {:?} {} with ns {}", qtype, qname, ns);
+
+        // The next step is to send the query to the active server.
+        let ns_copy = ns;
+
+        let server = (ns_copy, 53);
+        let response = lookup(qname, qtype, server)?;
+
+        // If there are entries in the answer section, and no errors, we are done!
+        if !response.answers.is_empty() && response.header.rescode == ResultCode::NOERROR {
+            return Ok(response);
+        }
+
+        // We might also get a `NXDOMAIN` reply, which is the authoritative name servers
+        // way of telling us that the name doesn't exist.
+        if response.header.rescode == ResultCode::NXDOMAIN {
+            return Ok(response);
+        }
+
+        // Otherwise, we'll try to find a new nameserver based on NS and a corresponding A
+        // record in the additional section. If this succeeds, we can switch name server
+        // and retry the loop.
+        if let Some(new_ns) = response.get_resolved_ns(qname) {
+            ns = new_ns;
+
+            continue;
+        }
+
+        // If not, we'll have to resolve the ip of a NS record. If no NS records exist,
+        // we'll go with what the last server told us.
+        let new_ns_name = match response.get_unresolved_ns(qname) {
+            Some(x) => x,
+            None => return Ok(response),
+        };
+
+        // Here we go down the rabbit hole by starting _another_ lookup sequence in the
+        // midst of our current one. Hopefully, this will give us the IP of an appropriate
+        // name server.
+        let recursive_response = recursive_lookup(&new_ns_name, QueryType::A)?;
+
+        // Finally, we pick a random ip from the result, and restart the loop. If no such
+        // record is available, we again return the last result we got.
+        if let Some(new_ns) = recursive_response.get_random_a() {
+            ns = new_ns;
+        } else {
+            return Ok(response);
+        }
+    }
+}
+
+fn handle_query(socket: &UdpSocket) -> Result<()> {
+    let mut req_buffer = BytePacketBuffer::new();
     let (_, src) = socket.recv_from(&mut req_buffer.buf)?;
 
-    // Next, `DnsPacket::from_buffer` is used to parse the raw bytes into
-    // a `DnsPacket`.
     let mut request = DnsPacket::from_buffer(&mut req_buffer)?;
 
-    // Create and initialize the response packet
     let mut packet = DnsPacket::new();
     packet.header.id = request.header.id;
     packet.header.recursion_desired = true;
     packet.header.recursion_available = true;
     packet.header.response = true;
 
-    // In the normal case, exactly one question is present
     if let Some(question) = request.questions.pop() {
         println!("Received query: {:?}", question);
 
-        // Since all is set up and as expected, the query can be forwarded to the
-        // target server. There's always the possibility that the query will
-        // fail, in which case the `SERVFAIL` response code is set to indicate
-        // as much to the client. If rather everything goes as planned, the
-        // question and response records as copied into our response packet.
-        if let Ok(result) = lookup(&question.name, question.qtype) {
-            packet.questions.push(question);
+        if let Ok(result) = recursive_lookup(&question.name, question.qtype) {
+            packet.questions.push(question.clone());
             packet.header.rescode = result.header.rescode;
 
             for rec in result.answers {
@@ -799,15 +855,10 @@ fn handle_query(socket: &UdpSocket) -> Result<()> {
         } else {
             packet.header.rescode = ResultCode::SERVFAIL;
         }
-    }
-    // Being mindful of how unreliable input data from arbitrary senders can be, we
-    // need make sure that a question is actually present. If not, we return `FORMERR`
-    // to indicate that the sender made something wrong.
-    else {
+    } else {
         packet.header.rescode = ResultCode::FORMERR;
     }
 
-    // The only thing remaining is to encode our response and send it off!
     let mut res_buffer = BytePacketBuffer::new();
     packet.write(&mut res_buffer)?;
 
@@ -820,14 +871,11 @@ fn handle_query(socket: &UdpSocket) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    // Bind an UDP socket on port 2053
     let socket = UdpSocket::bind(("0.0.0.0", 2053))?;
 
-    // For now, queries are handled sequentially, so an infinite loop for servicing
-    // requests is initiated.
     loop {
         match handle_query(&socket) {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(e) => eprintln!("An error occurred: {}", e),
         }
     }
